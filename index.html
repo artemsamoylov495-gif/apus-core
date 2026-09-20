@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>APUS Engine v0.75</title>
+    <style>
+        :root {
+            --bg-color: #0b0e14;
+            --card-bg: #151b26;
+            --accent-color: #00f2fe;
+            --text-color: #e0e6ed;
+            --danger-color: #ff4757;
+            --warn-color: #ffa502;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+        }
+        .container { max-width: 1100px; margin: 0 auto; }
+        .header {
+            display: flex; justify-content: space-between; align-items: center;
+            border-bottom: 2px solid #232d3f; padding-bottom: 15px; margin-bottom: 20px;
+        }
+        .badge {
+            background: #00d2ff22; color: var(--accent-color);
+            border: 1px solid var(--accent-color); padding: 4px 12px;
+            border-radius: 12px; font-size: 0.85em;
+        }
+        .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
+        .card {
+            background: var(--card-bg); border-radius: 10px;
+            padding: 20px; border: 1px solid #232d3f; margin-bottom: 20px;
+        }
+        .drop-zone {
+            border: 2px dashed var(--accent-color); border-radius: 8px;
+            padding: 30px; text-align: center; cursor: pointer;
+            transition: 0.2s; background: #00f2fe05;
+        }
+        .drop-zone:hover { background: #00f2fe15; }
+        input[type="file"] { display: none; }
+        input[type="text"], select, button {
+            background: #1c2433; border: 1px solid #2c384e;
+            color: #fff; padding: 10px 14px; border-radius: 6px; outline: none;
+        }
+        button { cursor: pointer; background: var(--accent-color); color: #000; font-weight: bold; border: none; }
+        button:hover { opacity: 0.9; }
+        .btn-danger { background: var(--danger-color); color: #fff; }
+        .chat-box {
+            height: 220px; overflow-y: auto; border: 1px solid #232d3f;
+            padding: 10px; border-radius: 6px; background: #0d1117; margin-bottom: 10px;
+        }
+        .msg { margin-bottom: 8px; font-size: 0.9em; }
+        .msg .sender { font-family: 'Courier New', Courier, monospace; font-weight: bold; font-size: 1em; }
+        .msg .e2e { color: #2ed573; font-size: 0.75em; margin-left: 5px; }
+        .search-bar { width: 97%; margin-bottom: 15px; font-size: 1em; }
+        .file-list { list-style: none; padding: 0; }
+        .file-item {
+            display: flex; justify-content: space-between; align-items: center;
+            background: #1a2230; padding: 10px 15px; border-radius: 6px; margin-bottom: 8px;
+        }
+        .warning-box {
+            font-size: 0.75em; color: var(--warn-color); margin-top: 8px; line-height: 1.3;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h2 id="modeTitle">APUS Engine Dashboard</h2>
+            <span class="badge">v0.75 Hirenkyaku</span>
+        </div>
+
+        <div class="grid">
+            <div class="main-col">
+                <div class="card">
+                    <h3>Zero-Copy File Transfer</h3>
+                    <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click();">
+                        📁 Перетащите файл сюда или <b>нажмите для выбора</b>
+                        <input type="file" id="fileInput" onchange="uploadSelectedFile(this.files[0])">
+                    </div>
+                    <div class="warning-box" id="zeroCopyWarning" style="display:none;">
+                        ⚠️ <b>Внимание:</b> При передаче файлов свыше 256 МБ стандартный Zero-Copy буфер отключается во избежание нехватки RAM, задействован потоковый режим.
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <h3>Общие файлы в сети</h3>
+                        <button id="btnClear" class="btn-danger" onclick="clearFiles()">Очистить историю</button>
+                    </div>
+                    <input type="text" id="searchInput" class="search-bar" placeholder="🔍 Быстрый поиск файлов..." oninput="filterFiles()">
+                    <ul class="file-list" id="fileList"></ul>
+                </div>
+            </div>
+
+            <div class="side-col">
+                <div class="card" id="meshRoomCard">
+                    <h3>P2P Mesh Комната</h3>
+                    <p style="font-size:0.85em; color:#a0aec0;">Код подключения:</p>
+                    <input type="text" id="roomCode" value="APUS-8839-X" readonly style="width:90%; font-family:monospace; font-weight:bold;">
+                    <br><br>
+                    <button onclick="copyInviteLink()" style="width:100%;">📋 Скопировать ссылку</button>
+                    
+                    <hr style="border-color:#232d3f; margin:15px 0;">
+                    <p style="font-size:0.85em; color:#a0aec0;">Лимит размера файла (Host Panel):</p>
+                    <select id="fileLimitSelect" style="width:100%; margin-bottom: 8px;" onchange="updateFileLimit()">
+                        <option value="4">4 МБ</option>
+                        <option value="16">16 МБ</option>
+                        <option value="64">64 МБ</option>
+                        <option value="256">256 МБ (Порог Zero-Copy)</option>
+                        <option value="512">512 МБ</option>
+                        <option value="1024">1 ГБ</option>
+                        <option value="4096">4 ГБ</option>
+                        <option value="16384">16 ГБ</option>
+                        <option value="32768" selected>Unlimited (32 ГБ+)</option>
+                    </select>
+
+                    <hr style="border-color:#232d3f; margin:15px 0;">
+                    <input type="text" id="joinCodeInput" placeholder="Вставьте код или ссылку..." style="width:90%; margin-bottom:8px;">
+                    <button onclick="joinRoom()" style="width:100%; background:#2ed573;">Войти в комнату</button>
+                </div>
+
+                <div class="card">
+                    <h3>Защищенный P2P Чат <span style="font-size:0.7em; color:#2ed573;">● E2E</span></h3>
+                    <div style="margin-bottom: 8px; display: flex; gap: 5px; align-items: center;">
+                        <span style="font-size: 0.8em; color: #a0aec0;">Ник:</span>
+                        <input type="text" id="usernameInput" style="padding: 5px 10px; font-size: 0.9em; flex: 1; font-family: monospace;" placeholder="Ваш никнейм" onchange="saveUsername()">
+                    </div>
+                    <div class="chat-box" id="chatBox"></div>
+                    <div style="display:flex; gap:5px;">
+                        <input type="text" id="chatMsgInput" placeholder="Сообщение..." style="flex:1;" onkeydown="if(event.key==='Enter') sendChat()">
+                        <button onclick="sendChat()">></button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let storedName = localStorage.getItem('apus_username');
+        if (!storedName) {
+            storedName = 'User-' + Math.floor(Math.random() * 900 + 100);
+            localStorage.setItem('apus_username', storedName);
+        }
+        document.getElementById('usernameInput').value = storedName;
+
+        function saveUsername() {
+            const val = document.getElementById('usernameInput').value.trim();
+            if (val) {
+                localStorage.setItem('apus_username', val);
+            }
+        }
+
+        async function updateFileLimit() {
+            const limit = parseInt(document.getElementById('fileLimitSelect').value);
+            await fetch('/api/room/limit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ limit_mb: limit })
+            });
+        }
+
+        async function refreshData() {
+            const resFiles = await fetch('/api/files');
+            const files = await resFiles.json();
+            renderFiles(files);
+
+            const resChat = await fetch('/api/chat');
+            const msgs = await resChat.json();
+            renderChat(msgs);
+        }
+
+        function renderFiles(files) {
+            const query = document.getElementById('searchInput').value.toLowerCase();
+            const list = document.getElementById('fileList');
+            list.innerHTML = '';
+            
+            files.filter(f => f.name.toLowerCase().includes(query)).forEach(f => {
+                const li = document.createElement('li');
+                li.className = 'file-item';
+                li.innerHTML = '<span>📄 <b>' + f.name + '</b> (' + f.size_mb.toFixed(2) + ' MB) <small style="color:#718096;">от ' + f.sender + '</small></span>' +
+                               '<a href="/api/download/' + f.id + '" download="' + f.name + '" style="color:var(--accent-color); text-decoration:none; font-weight:bold;">Скачать</a>';
+                list.appendChild(li);
+            });
+        }
+
+        function filterFiles() { refreshData(); }
+
+        async function uploadSelectedFile(file) {
+            if (!file) return;
+
+            // Проверка на триггер предупреждения Zero-Copy (> 256 MB)
+            const fileSizeMb = file.size / (1024 * 1024);
+            const warningBox = document.getElementById('zeroCopyWarning');
+            if (fileSizeMb > 256) {
+                warningBox.style.display = 'block';
+            } else {
+                warningBox.style.display = 'none';
+            }
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            const res = await fetch('/api/upload', {
+                method: 'POST',
+                body: formData
+            });
+            
+            const result = await res.json();
+            if (result.startsWith && result.startsWith("Error")) {
+                alert(result);
+            }
+            refreshData();
+        }
+
+        async function clearFiles() {
+            await fetch('/api/files/clear', { method: 'POST' });
+            refreshData();
+        }
+
+        function renderChat(msgs) {
+            const box = document.getElementById('chatBox');
+            box.innerHTML = '';
+            msgs.forEach(m => {
+                const div = document.createElement('div');
+                div.className = 'msg';
+                div.innerHTML = '<span class="sender" style="color: ' + m.color + ';">' + m.sender + ':</span> ' + m.text + ' <span class="e2e">[E2E]</span>';
+                box.appendChild(div);
+            });
+            box.scrollTop = box.scrollHeight;
+        }
+
+        async function sendChat() {
+            const input = document.getElementById('chatMsgInput');
+            if (!input.value.trim()) return;
+            const senderName = document.getElementById('usernameInput').value.trim() || 'Anonym';
+
+            const res = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sender: senderName, text: input.value })
+            });
+            
+            const result = await res.json();
+            if (result.Err) {
+                alert(result.Err);
+                return;
+            }
+
+            input.value = '';
+            refreshData();
+        }
+
+        function copyInviteLink() {
+            const code = document.getElementById('roomCode').value;
+            const link = window.location.origin + '/?room=' + code;
+            navigator.clipboard.writeText(link);
+            alert('Ссылка-приглашение скопирована!');
+        }
+
+        async function joinRoom() {
+            const val = document.getElementById('joinCodeInput').value;
+            if(!val) return;
+            await fetch('/api/room/join', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code: val })
+            });
+            alert('Подключено к комнате: ' + val);
+            document.getElementById('joinCodeInput').value = '';
+        }
+
+        const dropZone = document.getElementById('dropZone');
+        ['dragenter', 'dragover'].forEach(e => dropZone.addEventListener(e, (evt) => evt.preventDefault()));
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            if (e.dataTransfer.files.length) {
+                uploadSelectedFile(e.dataTransfer.files[0]);
+            }
+        });
+
+        setInterval(refreshData, 2000);
+        refreshData();
+    </script>
+</body>
+</html>

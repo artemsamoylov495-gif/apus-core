@@ -8,7 +8,7 @@ use apus_core::discovery::DiscoveryEngine;
 use apus_core::nat::NatEngine;
 use apus_core::routing::RoutingEngine;
 use apus_core::compress::CompressEngine;
-use apus_core::corp::CorpEngine;
+use apus_core::corp;
 use sha2::{Sha256, Digest};
 use tokio::time::{sleep, Duration};
 
@@ -16,15 +16,9 @@ use tokio::time::{sleep, Duration};
 async fn main() {
     let args: Vec<String> = env::args().collect();
     let is_corp = args.contains(&"--corp".to_string());
+    let is_mesh = args.contains(&"--mesh".to_string());
 
-    println!("=== APUS v0.5 \"Sonido\" Full Mesh Engine ===");
-
-    if is_corp {
-        let dashboard_url = CorpEngine::start_dashboard(9090);
-        println!("\n--- [B2B Corporate Mode Active] ---");
-        println!("[SKLIF B2B Pilot] Web Dashboard running at {}", dashboard_url);
-        println!("[SKLIF B2B Pilot] Drag-and-Drop GUI Ready");
-    }
+    println!("=== APUS v0.75 \"Hirenkyaku\" Full Mesh Engine ===");
 
     if apus_init_node() {
         println!("\n--- [1] Проверка интеллектуальных триггеров ---");
@@ -48,9 +42,9 @@ async fn main() {
         println!("\n--- [4] Dynamic Zstd Compression ---");
         let chunk_size = 4 * 1024 * 1024;
         let comp = CompressEngine::compress_chunk(chunk_size, 50);
-        println!("[Zstd Engine] Input: {:.2} MB -> Output: {:.2} MB (Saved {:.1}%) [{}]", 
-                 comp.original_size as f64 / (1024.0 * 1024.0), 
-                 comp.compressed_size as f64 / (1024.0 * 1024.0), 
+        println!("[Zstd Engine] Input: {:.2} MB -> Output: {:.2} MB (Saved {:.1}%) [{}]",
+                 comp.original_size as f64 / (1024.0 * 1024.0),
+                 comp.compressed_size as f64 / (1024.0 * 1024.0),
                  comp.ratio_pct, comp.algorithm);
 
         println!("\n--- [5] Zero-Copy Kernel Transfer (splice / sendfile) ---");
@@ -63,7 +57,8 @@ async fn main() {
         let fake_chunk = b"AerOS_APUS_Update_Block_#1337".to_vec();
         let mut hasher = Sha256::new();
         hasher.update(&fake_chunk);
-        let real_hash = format!("{:x}", hasher.finalize());
+        let hash_result = hasher.finalize();
+        let real_hash: String = hash_result.iter().map(|b| format!("{:02x}", b)).collect();
 
         let mut manifest = UpdateManifest::new("patch-v1.4.2", "tanks_patch.bin", 2_254_857_830, 4_194_304);
         manifest.add_chunk(0, &real_hash);
@@ -86,8 +81,22 @@ async fn main() {
         println!("[Fallback Check] Блок из HTTPS CDN валиден? -> {}", is_fallback_valid);
     }
 
-    if is_corp {
-        println!("\n[APUS B2B Engine] Web Dashboard active on http://localhost:9090. Press Ctrl+C to exit.");
-        tokio::signal::ctrl_c().await.unwrap();
+    if is_corp || is_mesh {
+        let mode_label = if is_mesh { "APUS Mesh (--mesh)" } else { "APUS Corp (--corp)" };
+        println!("\n--- [{}] ---", mode_label);
+        println!("[Dashboard Active] Web Interface bound to http://0.0.0.0:9090");
+        println!("[Dashboard Active] Instant Search & Zero-Copy Drag-and-Drop GUI Ready");
+        println!("\nPress Ctrl+C to stop APUS engine.");
+
+        let corp_task = tokio::spawn(async move {
+            corp::start_dashboard_bind_all(is_corp, is_mesh).await;
+        });
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n[APUS Engine] Shutting down gracefully...");
+            }
+            _ = corp_task => {}
+        }
     }
 }

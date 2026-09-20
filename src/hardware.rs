@@ -11,12 +11,12 @@ pub struct HardwareScore {
 pub fn evaluate_node() -> HardwareScore {
     let mut sys = System::new_with_specifics(
         RefreshKind::new()
-            .with_cpu(CpuRefreshKind::new())
-            .with_memory(MemoryRefreshKind::new()),
+            .with_cpu(CpuRefreshKind::everything())
+            .with_memory(MemoryRefreshKind::everything()),
     );
-    
+
     sys.refresh_memory();
-    sys.refresh_cpu();
+    sys.refresh_cpu_usage();
 
     let total_ram_gb = sys.total_memory() / 1024 / 1024 / 1024;
     let logical_cores = sys.cpus().len();

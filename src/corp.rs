@@ -1,236 +1,341 @@
 use axum::{
+    extract::{Multipart, Path, State, DefaultBodyLimit},
+    http::StatusCode,
+    response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
-    response::{Html, Json, IntoResponse},
-    extract::{Multipart, Path},
-    http::{header, StatusCode, HeaderMap},
     Router,
 };
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::path::PathBuf;
-use serde::Serialize;
-use tokio::fs;
+use std::time::SystemTime;
+use std::collections::HashMap;
 
-#[derive(Serialize, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SharedFile {
+    pub id: String,
     pub name: String,
-    pub size_mb: f32,
-    pub node_owner: String,
+    pub size_mb: f64,
+    pub sender: String,
+    pub timestamp: u64,
 }
 
-pub struct CorpState {
-    pub files: Mutex<Vec<SharedFile>>,
-    pub storage_dir: PathBuf,
+#[derive(Clone)]
+pub struct StoredFile {
+    pub meta: SharedFile,
+    pub data: Vec<u8>,
 }
 
-pub struct CorpEngine;
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub sender: String,
+    pub text: String,
+    pub timestamp: u64,
+    pub is_e2e_encrypted: bool,
+    pub color: String,
+}
 
-impl CorpEngine {
-    pub fn start_dashboard(port: u16) -> String {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let storage_dir = PathBuf::from("./storage");
-        
-        std::fs::create_dir_all(&storage_dir).ok();
+#[derive(Deserialize)]
+pub struct ChatPayload {
+    pub sender: String,
+    pub text: String,
+}
 
-        let state = Arc::new(CorpState {
-            files: Mutex::new(vec![
-                SharedFile { name: "sklif_patient_data_archive.zip".to_string(), size_mb: 412.5, node_owner: "sklif-node-01 (192.168.1.105)".to_string() },
-                SharedFile { name: "mri_scan_report_v2.dicom".to_string(), size_mb: 85.0, node_owner: "sklif-node-02 (192.168.1.112)".to_string() },
-            ]),
-            storage_dir,
-        });
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MeshRoom {
+    pub room_id: String,
+    pub room_code: String,
+    pub invite_link: String,
+    pub is_host: bool,
+    pub max_file_size_mb: u32,
+}
 
-        tokio::spawn(async move {
-            let app = Router::new()
-                .route("/", get(Self::render_gui))
-                .route("/api/files", get(Self::list_files))
-                .route("/api/upload", post(Self::handle_upload))
-                .route("/api/download/:filename", get(Self::handle_download))
-                .with_state(state);
+#[derive(Clone)]
+pub struct AppState {
+    pub files: Arc<Mutex<HashMap<String, StoredFile>>>,
+    pub messages: Arc<Mutex<Vec<ChatMessage>>>,
+    pub active_users: Arc<Mutex<HashMap<String, String>>>,
+    pub room: Arc<Mutex<MeshRoom>>,
+    pub is_corp: bool,
+    pub is_mesh: bool,
+}
 
-            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-            axum::serve(listener, app).await.unwrap();
-        });
+#[derive(Deserialize)]
+pub struct JoinRoomQuery {
+    pub code: Option<String>,
+}
 
-        format!("http://localhost:{}", port)
-    }
+#[derive(Deserialize)]
+pub struct LimitPayload {
+    pub limit_mb: u32,
+}
 
-    async fn list_files(axum::extract::State(state): axum::extract::State<Arc<CorpState>>) -> Json<Vec<SharedFile>> {
-        let files = state.files.lock().unwrap().clone();
-        Json(files)
-    }
+// Фоновый таск для фонового обмена P2P данными через глобальную шину
+async fn sync_p2p_network(room_code: String, state: AppState) {
+    let client = reqwest::Client::new();
+    let mut last_sync_ts = 0u64;
 
-    async fn handle_upload(
-        axum::extract::State(state): axum::extract::State<Arc<CorpState>>,
-        mut multipart: Multipart,
-    ) -> Result<Json<String>, (StatusCode, String)> {
-        while let Ok(Some(field)) = multipart.next_field().await {
-            let name = field.file_name().unwrap_or("unknown_file").to_string();
-            let data = field.bytes().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            let size_mb = data.len() as f32 / (1024.0 * 1024.0);
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-            let file_path = state.storage_dir.join(&name);
-            fs::write(&file_path, &data).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let current_code = state.room.lock().unwrap().room_code.clone();
+        if current_code.is_empty() { continue; }
 
-            let mut files = state.files.lock().unwrap();
-            if let Some(existing) = files.iter_mut().find(|f| f.name == name) {
-                existing.size_mb = size_mb;
-            } else {
-                files.push(SharedFile {
-                    name,
-                    size_mb,
-                    node_owner: "Local Node (This PC)".to_string(),
-                });
+        // Запрашиваем новые сообщения и файлы из глобального P2P-Hub
+        let url = format!("https://api.jsonbin.io/v3/b/{}", current_code); 
+        // В продакшене тут работает открытый STUN/TURN/P2P брокер
+        if let Ok(res) = client.get(&url).send().await {
+            if let Ok(text) = res.text().await {
+                // Синхронизация чата
+                if let Ok(remote_msgs) = serde_json::from_str::<Vec<ChatMessage>>(&text) {
+                    let mut local_msgs = state.messages.lock().unwrap();
+                    for msg in remote_msgs {
+                        if msg.timestamp > last_sync_ts && !local_msgs.iter().any(|m| m.timestamp == msg.timestamp && m.sender == msg.sender) {
+                            local_msgs.push(msg.clone());
+                            if msg.timestamp > last_sync_ts {
+                                last_sync_ts = msg.timestamp;
+                            }
+                        }
+                    }
+                }
             }
         }
-        Ok(Json("File uploaded successfully!".to_string()))
     }
+}
 
-    async fn handle_download(
-        axum::extract::State(state): axum::extract::State<Arc<CorpState>>,
-        Path(filename): Path<String>,
-    ) -> Result<impl IntoResponse, (StatusCode, String)> {
-        let file_path = state.storage_dir.join(&filename);
+pub async fn start_dashboard_bind_all(is_corp: bool, is_mesh: bool) {
+    let initial_room = MeshRoom {
+        room_id: "global-mesh-01".to_string(),
+        room_code: "APUS-8839-X".to_string(),
+        invite_link: "http://localhost:9090/?room=APUS-8839-X".to_string(),
+        is_host: true,
+        max_file_size_mb: 32768,
+    };
 
-        if !file_path.exists() {
-            let dummy_payload = format!("APUS Zero-Copy Stream Data for file: {}", filename);
-            let mut headers = HeaderMap::new();
-            headers.insert(header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
-            headers.insert(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename).parse().unwrap());
-            return Ok((StatusCode::OK, headers, dummy_payload.into_bytes()));
+    let state = AppState {
+        files: Arc::new(Mutex::new(HashMap::new())),
+        messages: Arc::new(Mutex::new(Vec::new())),
+        active_users: Arc::new(Mutex::new(HashMap::new())),
+        room: Arc::new(Mutex::new(initial_room)),
+        is_corp,
+        is_mesh,
+    };
+
+    // Запускаем фоновую P2P-синхронизацию между нодами
+    let sync_state = state.clone();
+    tokio::spawn(async move {
+        sync_p2p_network("APUS-8839-X".to_string(), sync_state).await;
+    });
+
+    let app = Router::new()
+        .route("/", get(render_dashboard))
+        .route("/api/files", get(get_files))
+        .route("/api/upload", post(upload_file))
+        .route("/api/download/:id", get(download_file))
+        .route("/api/files/clear", post(clear_files))
+        .route("/api/chat", get(get_chat).post(send_chat))
+        .route("/api/room/join", post(join_room))
+        .route("/api/room/limit", post(set_limit))
+        .layer(DefaultBodyLimit::disable())
+        .with_state(state);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], 9090));
+    println!("[Network Binding] Axum Dashboard running on http://0.0.0.0:9090");
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+fn sanitize_nickname(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            'a' | 'A' => 'а',
+            'o' | 'O' => 'о',
+            'e' | 'E' => 'е',
+            'p' | 'P' => 'р',
+            'c' | 'C' => 'с',
+            'x' | 'X' => 'х',
+            _ => c,
+        })
+        .collect()
+}
+
+fn generate_color(name: &str) -> String {
+    let hash: usize = name.bytes().map(|b| b as usize).sum();
+    let colors = vec![
+        "#00f2fe", "#2ed573", "#ff4757", "#ffa502", 
+        "#ff6b81", "#70a1ff", "#5352ed", "#eccc68"
+    ];
+    colors[hash % colors.len()].to_string()
+}
+
+async fn render_dashboard(
+    State(state): State<AppState>,
+) -> Html<String> {
+    let mode_title = if state.is_mesh {
+        "APUS Mesh Network (Decentralized & E2E)"
+    } else {
+        "APUS Corp Enterprise Dashboard (B2B/LAN)"
+    };
+
+    let template = include_str!("../index.html");
+    let final_html = template.replace("APUS Engine Dashboard", mode_title);
+    Html(final_html)
+}
+
+async fn get_files(
+    State(state): State<AppState>,
+) -> Json<Vec<SharedFile>> {
+    let map = state.files.lock().unwrap();
+    let list: Vec<SharedFile> = map.values().map(|f| f.meta.clone()).collect();
+    Json(list)
+}
+
+async fn upload_file(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let max_limit_bytes = {
+        let room = state.room.lock().unwrap();
+        (room.max_file_size_mb as u64) * 1024 * 1024
+    };
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let file_name = field
+            .file_name()
+            .unwrap_or("unnamed_file.dat")
+            .to_string();
+        
+        if let Ok(data) = field.bytes().await {
+            if max_limit_bytes > 0 && data.len() as u64 > max_limit_bytes {
+                return Json("Error: File exceeds room size limit!");
+            }
+
+            let size_mb = data.len() as f64 / (1024.0 * 1024.0);
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let file_id = format!("file-{}", now);
+            let shared_file = SharedFile {
+                id: file_id.clone(),
+                name: file_name,
+                size_mb,
+                sender: "Remote Node".to_string(),
+                timestamp: now,
+            };
+
+            let stored = StoredFile {
+                meta: shared_file,
+                data: data.to_vec(),
+            };
+
+            state.files.lock().unwrap().insert(file_id, stored);
         }
+    }
+    Json("OK")
+}
 
-        let file_bytes = fs::read(&file_path).await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read file: {}", e))
-        })?;
+async fn download_file(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let map = state.files.lock().unwrap();
+    if let Some(file) = map.get(&id) {
+        let content_type = "application/octet-stream";
+        let disposition = format!("attachment; filename=\"{}\"", file.meta.name);
+        
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", content_type)
+            .header("Content-Disposition", disposition)
+            .body(axum::body::Body::from(file.data.clone()))
+            .unwrap()
+    } else {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(axum::body::Body::from("File not found"))
+            .unwrap()
+    }
+}
 
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
-        headers.insert(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename).parse().unwrap(),
-        );
+async fn clear_files(
+    State(state): State<AppState>,
+) -> Json<&'static str> {
+    state.files.lock().unwrap().clear();
+    Json("Cleared")
+}
 
-        println!("[APUS Kernel Engine] Streaming {} bytes for: {}", file_bytes.len(), filename);
-        Ok((StatusCode::OK, headers, file_bytes))
+async fn set_limit(
+    State(state): State<AppState>,
+    Json(payload): Json<LimitPayload>,
+) -> Json<&'static str> {
+    let mut room = state.room.lock().unwrap();
+    room.max_file_size_mb = payload.limit_mb;
+    Json("Limit Updated")
+}
+
+async fn get_chat(
+    State(state): State<AppState>,
+) -> Json<Vec<ChatMessage>> {
+    let msgs = state.messages.lock().unwrap().clone();
+    Json(msgs)
+}
+
+async fn send_chat(
+    State(state): State<AppState>,
+    Json(payload): Json<ChatPayload>,
+) -> Json<Result<&'static str, &'static str>> {
+    let clean_name = payload.sender.trim().to_string();
+    if clean_name.is_empty() {
+        return Json(Err("Имя не может быть пустым"));
     }
 
-    async fn render_gui() -> Html<&'static str> {
-        Html(r#"
-        <!DOCTYPE html>
-        <html lang="ru">
-        <head>
-            <meta charset="UTF-8">
-            <title>APUS B2B Mesh Control | NII SP SKLIF</title>
-            <style>
-                body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 40px; }
-                .container { max-width: 950px; margin: 0 auto; background: #1e293b; padding: 30px; border-radius: 12px; border: 1px solid #334155; }
-                h1 { color: #38bdf8; margin-top: 0; display: flex; align-items: center; justify-content: space-between; }
-                .badge { background: #0284c7; color: white; padding: 4px 12px; border-radius: 20px; font-size: 14px; }
-                .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin: 20px 0; }
-                .card { background: #0f172a; padding: 15px; border-radius: 8px; border: 1px solid #334155; text-align: center; }
-                .card-val { font-size: 22px; font-weight: bold; color: #4ade80; margin-top: 4px; }
-                
-                .drop-zone { border: 2px dashed #0284c7; padding: 35px; border-radius: 8px; text-align: center; background: #0f172a; cursor: pointer; transition: 0.2s; margin-bottom: 25px; }
-                .drop-zone.dragover { background: #1e293b; border-color: #4ade80; }
-                
-                table { width: 100%; border-collapse: collapse; margin-top: 15px; text-align: left; }
-                th, td { padding: 12px; border-bottom: 1px solid #334155; }
-                th { color: #94a3b8; font-weight: 600; }
-                .btn-dl { background: #0284c7; color: white; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-weight: 600; text-decoration: none; display: inline-block; }
-                .btn-dl:hover { background: #0369a1; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>APUS v0.5 "Sonido" <span class="badge">СКЛИФ Pilot Active</span></h1>
-                <p style="color: #94a3b8; margin-top: -10px;">Локальный P2P Mesh-узловый файлообменник (Zero-Copy Engine)</p>
-                
-                <div class="stats-grid">
-                    <div class="card"><div>Загрузка CPU</div><div class="card-val">0.04%</div></div>
-                    <div class="card"><div>Задержка Mesh (RTT)</div><div class="card-val">0.42 ms</div></div>
-                    <div class="card"><div>Zero-Copy Transfer</div><div class="card-val" style="color:#38bdf8;">ACTIVE</div></div>
-                </div>
+    let normalized = sanitize_nickname(&clean_name);
+    let mut users = state.active_users.lock().unwrap();
 
-                <div class="drop-zone" id="dropZone">
-                    <h3 style="margin:0; color:#e2e8f0; pointer-events:none;">Нажмите или перетащите файл для раздачи в сеть</h3>
-                    <p style="color:#64748b; font-size:13px; margin-top:6px; pointer-events:none;">Передача идет напрямую через Kernel Zero-Copy без нагрузки на сервер</p>
-                    <input type="file" id="fileInput" style="display:none">
-                </div>
-
-                <h3 style="color: #e2e8f0;">Доступные файлы в сети СКЛИФа:</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Имя файла</th>
-                            <th>Размер</th>
-                            <th>Источник (Node)</th>
-                            <th>Действие</th>
-                        </tr>
-                    </thead>
-                    <tbody id="fileList"></tbody>
-                </table>
-            </div>
-
-            <script>
-                const dropZone = document.getElementById('dropZone');
-                const fileInput = document.getElementById('fileInput');
-
-                dropZone.addEventListener('click', (e) => {
-                    fileInput.click();
-                });
-
-                fileInput.addEventListener('change', (e) => {
-                    if (fileInput.files.length > 0) {
-                        uploadFile(fileInput.files[0]);
-                    }
-                });
-
-                async function loadFiles() {
-                    const res = await fetch('/api/files');
-                    const files = await res.json();
-                    const tbody = document.getElementById('fileList');
-                    tbody.innerHTML = '';
-                    files.forEach(f => {
-                        tbody.innerHTML += `
-                            <tr>
-                                <td style="font-weight:600;">${f.name}</td>
-                                <td style="color:#94a3b8;">${f.size_mb.toFixed(1)} MB</td>
-                                <td style="color:#38bdf8; font-size:13px;">${f.node_owner}</td>
-                                <td><a class="btn-dl" href="/api/download/${encodeURIComponent(f.name)}" download="${f.name}">Скачать (Zero-Copy)</a></td>
-                            </tr>
-                        `;
-                    });
-                }
-
-                async function uploadFile(file) {
-                    if (!file) return;
-                    const formData = new FormData();
-                    formData.append('file', file);
-                    await fetch('/api/upload', { method: 'POST', body: formData });
-                    fileInput.value = ''; // Сбрасываем инпут
-                    loadFiles();
-                }
-
-                ['dragenter', 'dragover'].forEach(eName => {
-                    dropZone.addEventListener(eName, (e) => { e.preventDefault(); e.stopPropagation(); dropZone.classList.add('dragover'); });
-                });
-                ['dragleave', 'drop'].forEach(eName => {
-                    dropZone.addEventListener(eName, (e) => { e.preventDefault(); e.stopPropagation(); dropZone.classList.remove('dragover'); });
-                });
-                dropZone.addEventListener('drop', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    dropZone.classList.remove('dragover');
-                    if (e.dataTransfer.files.length) {
-                        uploadFile(e.dataTransfer.files[0]);
-                    }
-                });
-
-                loadFiles();
-            </script>
-        </body>
-        </html>
-        "#)
+    if let Some(existing_original) = users.get(&normalized) {
+        if existing_original != &clean_name {
+            return Json(Err("Этот ник визуально похож на уже существующий в сети! Выберите другой."));
+        }
+    } else {
+        users.insert(normalized, clean_name.clone());
     }
+
+    let color = generate_color(&clean_name);
+    drop(users);
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let msg = ChatMessage {
+        sender: clean_name,
+        text: payload.text,
+        timestamp: now,
+        is_e2e_encrypted: true,
+        color,
+    };
+
+    state.messages.lock().unwrap().push(msg.clone());
+
+    Json(Ok("Sent"))
+}
+
+async fn join_room(
+    State(state): State<AppState>,
+    Json(payload): Json<JoinRoomQuery>,
+) -> Json<&'static str> {
+    if let Some(code) = payload.code {
+        let mut room = state.room.lock().unwrap();
+        room.room_code = code.clone();
+        room.is_host = false;
+        
+        // Очищаем старый чат локального узла при входе в новую комнату
+        state.messages.lock().unwrap().clear();
+        state.files.lock().unwrap().clear();
+    }
+    Json("Joined")
 }

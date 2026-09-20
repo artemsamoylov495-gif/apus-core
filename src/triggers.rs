@@ -15,14 +15,14 @@ impl TriggerMonitor {
     pub fn new() -> Self {
         Self {
             sys: System::new_with_specifics(
-                RefreshKind::new().with_cpu(CpuRefreshKind::new()),
+                RefreshKind::new().with_cpu(CpuRefreshKind::everything()),
             ),
         }
     }
 
     pub fn check_current_mode(&mut self, is_user_idle_10min: bool, is_fullscreen_media: bool) -> WorkMode {
-        self.sys.refresh_cpu();
-        
+        self.sys.refresh_cpu_usage();
+
         let global_cpu_usage = self.sys.global_cpu_info().cpu_usage();
 
         // 1. Если запущен тяжелый софт или игра (CPU > 50%) — моментальное глушение раздачи

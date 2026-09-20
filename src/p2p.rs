@@ -8,7 +8,12 @@ impl BlockValidator {
         let mut hasher = Sha256::new();
         hasher.update(data);
         let result = hasher.finalize();
-        let calculated_hash = format!("{:x}", result);
+        
+        // Преобразуем GenericArray в hex-строку через байтовый срез
+        let calculated_hash: String = result
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
 
         calculated_hash == expected_hash
     }
